@@ -12,12 +12,16 @@ import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
+import type { FloodReport } from '@/types/report'
+import { matchLatestSection } from '@/types/report'
+import type { Correction } from '@/types/correction'
+import { calcReportDeviationPct, isReportDeviationOver } from '@/types/correction'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
 import { fitPowerCurve } from '@/types/rating'
-import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
+import { calcMeanVelocity, sectionFlowFromRows, DEFAULT_WEIGHTS, round } from '@/utils/flow'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +44,8 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  reports: FloodReport[]
+  corrections: Correction[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +55,8 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  reports!: Table<FloodReport, string>
+  corrections!: Table<Correction, string>
 
   constructor() {
     super(DB_NAME)
@@ -64,7 +72,7 @@ class HydroGaugeDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（河名/集水面积、水位、测法、偏差判定）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
         sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
@@ -93,6 +101,62 @@ class HydroGaugeDatabase extends Dexie {
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt
               Object.assign(row, defaults())
             })
+        }
+      })
+
+    // v3：新增报汛时段与实测挂接校正两表（实测与报汛各记各的，按测流时刻对账）；
+    // 测站补修正策略；旧数据没有实测归属的照时刻回填最近一次实测，对不上的保持未匹配由页面单列
+    this.version(DB_VERSION)
+      .stores({
+        stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
+        sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
+        verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
+        points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
+        ratings: 'id, stationId, lineNo, stageM, flowM3s, measuredAt, updatedAt',
+        compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt',
+        reports: 'id, stationId, lineNo, status, periodStart, periodEnd, reportedAt, updatedAt',
+        corrections: 'id, reportId, sectionId, status, attachedAt, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 测站补修正策略：缺省「只改本次报汛」，两边商量定后可在报汛对账页按站切换
+        await tx
+          .table('stations')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (row.correctionPolicy !== 'single' && row.correctionPolicy !== 'segment') {
+              row.correctionPolicy = 'single'
+            }
+          })
+        // 旧数据回填：没有实测归属的报汛，照时刻挂最近一次实测；对不上的不挂，页面单列
+        const sections = (await tx.table('sections').toArray()) as Section[]
+        const verticals = (await tx.table('verticals').toArray()) as Vertical[]
+        const points = (await tx.table('points').toArray()) as Point[]
+        const legacyReports = (await tx.table('reports').toArray()) as FloodReport[]
+        const now = Date.now()
+        for (const report of legacyReports) {
+          const linked = await tx.table('corrections').where('reportId').equals(report.id).count()
+          if (linked > 0) continue
+          const section = matchLatestSection(sections, report)
+          if (!section) continue
+          const measuredFlowM3s = sectionFlowFromRows(verticals, points, section.id)
+          const deviationPct = calcReportDeviationPct(measuredFlowM3s, report.reportedFlowM3s)
+          const row: Correction = {
+            id: createId('cor'),
+            reportId: report.id,
+            sectionId: section.id,
+            measuredFlowM3s,
+            reportedFlowM3s: report.reportedFlowM3s,
+            deviationPct,
+            status: '已挂',
+            origin: '升级回填',
+            attachedAt: new Date(now).toISOString(),
+            createdAt: now,
+            updatedAt: now
+          }
+          await tx.table('corrections').put(row)
+          if (isReportDeviationOver(deviationPct) && report.status === '正常') {
+            await tx.table('reports').update(report.id, { status: '待修正', updatedAt: now })
+          }
         }
       })
   }
@@ -145,7 +209,8 @@ export async function seedDemoData(): Promise<void> {
         river: '澜沧江',
         catchmentKm2: 45200,
         sectionCode: 'CS-LM-01',
-        remark: '基本水文站，缆道测流，断面稳定'
+        remark: '基本水文站，缆道测流，断面稳定',
+        correctionPolicy: 'segment'
       },
       sections: [
         {
@@ -193,7 +258,8 @@ export async function seedDemoData(): Promise<void> {
         river: '沅江',
         catchmentKm2: 1860,
         sectionCode: 'CS-QJ-02',
-        remark: '小河站，浮标法为主，洪水期加测'
+        remark: '小河站，浮标法为主，洪水期加测',
+        correctionPolicy: 'single'
       },
       sections: [
         {
@@ -241,7 +307,8 @@ export async function seedDemoData(): Promise<void> {
         river: '澜沧江',
         catchmentKm2: 51200,
         sectionCode: 'CS-BS-03',
-        remark: '巡测断面，与龙门站比测'
+        remark: '巡测断面，与龙门站比测',
+        correctionPolicy: 'single'
       },
       sections: [
         {
@@ -287,9 +354,36 @@ export async function seedDemoData(): Promise<void> {
     { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 288.0, lineNo: 'C', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z' }
   ]
 
+  // 报汛时段：值班室按整点水位查临时关系线报出；与实测各记各的，按测流时刻对账
+  const reportSeeds: Array<Omit<FloodReport, 'createdAt' | 'updatedAt'>> = [
+    // 龙门 6-12 两段连续报汛（同站同线首尾相接，演示「整段照实测偏移重报」）
+    { id: 'rep_lh_0612a', stationId: 'stn_lh01', periodStart: '2024-06-12T08:00:00.000Z', periodEnd: '2024-06-12T09:00:00.000Z', stageM: 5.42, lineNo: 'A', reportedFlowM3s: 42.0, dutyOperator: '林昭', status: '待修正', reportedAt: '2024-06-12T08:05:00.000Z' },
+    { id: 'rep_lh_0612b', stationId: 'stn_lh01', periodStart: '2024-06-12T09:00:00.000Z', periodEnd: '2024-06-12T10:00:00.000Z', stageM: 5.5, lineNo: 'A', reportedFlowM3s: 43.0, dutyOperator: '林昭', status: '正常', reportedAt: '2024-06-12T09:05:00.000Z' },
+    { id: 'rep_lh_0718', stationId: 'stn_lh01', periodStart: '2024-07-18T09:00:00.000Z', periodEnd: '2024-07-18T10:00:00.000Z', stageM: 6.15, lineNo: 'A', reportedFlowM3s: 6.4, dutyOperator: '周渝', status: '正常', reportedAt: '2024-07-18T09:04:00.000Z' },
+    { id: 'rep_qj_0809', stationId: 'stn_qj02', periodStart: '2024-08-09T06:00:00.000Z', periodEnd: '2024-08-09T07:00:00.000Z', stageM: 4.36, lineNo: 'B', reportedFlowM3s: 9.4, dutyOperator: '林昭', status: '正常', reportedAt: '2024-08-09T06:03:00.000Z' },
+    // 白沙滩 4-15 报汛：该站此前没有测次，回填也对不上，演示「未匹配单列」
+    { id: 'rep_bs_0415', stationId: 'stn_bs03', periodStart: '2024-04-15T08:00:00.000Z', periodEnd: '2024-04-15T09:00:00.000Z', stageM: 4.5, lineNo: 'C', reportedFlowM3s: 30.0, dutyOperator: '周渝', status: '正常', reportedAt: '2024-04-15T08:06:00.000Z' },
+    { id: 'rep_bs_0620', stationId: 'stn_bs03', periodStart: '2024-06-20T10:00:00.000Z', periodEnd: '2024-06-20T11:00:00.000Z', stageM: 5.36, lineNo: 'C', reportedFlowM3s: 52.5, dutyOperator: '周渝', status: '正常', reportedAt: '2024-06-20T10:07:00.000Z' }
+  ]
+
+  // 实测断面流量：按测验组口径（垂线 + 测点）现算，保证挂接快照与页面一致
+  const seedVerticals = stationBundles.flatMap((bundle) => bundle.verticals)
+  const seedPoints = stationBundles.flatMap((bundle) => bundle.points)
+  const flowOf = (sectionId: string): number => sectionFlowFromRows(seedVerticals, seedPoints, sectionId)
+
+  // 实测挂接校正：每次测完挂到盖住它的报汛时段上，实测值和报汛值摆一起比
+  const correctionSeeds: Correction[] = [
+    // 龙门 6-12 08:30 测流挂到 08:00–09:00 时段：报汛 42.0 比实测高约 9.2%，超限 → 该次报汛挂待修正
+    { id: 'cor_lh_1', reportId: 'rep_lh_0612a', sectionId: 'sec_lh_2406', measuredFlowM3s: flowOf('sec_lh_2406'), reportedFlowM3s: 42.0, deviationPct: calcReportDeviationPct(flowOf('sec_lh_2406'), 42.0), status: '已挂', origin: '测验挂接', attachedAt: '2024-06-12T09:20:00.000Z', createdAt: now, updatedAt: now },
+    { id: 'cor_lh_2', reportId: 'rep_lh_0718', sectionId: 'sec_lh_2407', measuredFlowM3s: flowOf('sec_lh_2407'), reportedFlowM3s: 6.4, deviationPct: calcReportDeviationPct(flowOf('sec_lh_2407'), 6.4), status: '已挂', origin: '测验挂接', attachedAt: '2024-07-18T10:15:00.000Z', createdAt: now, updatedAt: now },
+    { id: 'cor_qj_1', reportId: 'rep_qj_0809', sectionId: 'sec_qj_2408', measuredFlowM3s: flowOf('sec_qj_2408'), reportedFlowM3s: 9.4, deviationPct: calcReportDeviationPct(flowOf('sec_qj_2408'), 9.4), status: '已挂', origin: '测验挂接', attachedAt: '2024-08-09T07:10:00.000Z', createdAt: now, updatedAt: now },
+    // 白沙滩 6-20 测流：值班室随后改动了报汛时段，校正失效退回待挂（快照保留改动前的报汛值 51.0），待测验组重挂
+    { id: 'cor_bs_1', reportId: 'rep_bs_0620', sectionId: 'sec_bs_2406', measuredFlowM3s: flowOf('sec_bs_2406'), reportedFlowM3s: 51.0, deviationPct: calcReportDeviationPct(flowOf('sec_bs_2406'), 51.0), status: '待挂', origin: '测验挂接', attachedAt: '2024-06-20T11:05:00.000Z', createdAt: now, updatedAt: now }
+  ]
+
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.reports, db.corrections],
     async () => {
       const stamp = (row: { id: string }): { createdAt: number; updatedAt: number } => ({
         createdAt: now + row.id.length,
@@ -315,6 +409,8 @@ export async function seedDemoData(): Promise<void> {
         )
       )
       await db.ratings.bulkPut(ratingSeeds.map((rating) => ({ ...rating, ...stamp(rating) })))
+      await db.reports.bulkPut(reportSeeds.map((report) => ({ ...report, ...stamp(report) })))
+      await db.corrections.bulkPut(correctionSeeds)
 
       // 比测记录：按定线拟合出曲线流量后计算偏差与判定，保证与页面展示一致
       const compares: Compare[] = []
@@ -375,7 +471,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.reports, db.corrections],
     async () => {
       await Promise.all([
         db.stations.clear(),
@@ -383,7 +479,9 @@ export async function clearAllTables(): Promise<void> {
         db.verticals.clear(),
         db.points.clear(),
         db.ratings.clear(),
-        db.compares.clear()
+        db.compares.clear(),
+        db.reports.clear(),
+        db.corrections.clear()
       ])
     }
   )
@@ -397,15 +495,17 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, reports, corrections] = await Promise.all([
     db.stations.count(),
     db.sections.count(),
     db.verticals.count(),
     db.points.count(),
     db.ratings.count(),
-    db.compares.count()
+    db.compares.count(),
+    db.reports.count(),
+    db.corrections.count()
   ])
-  return { stations, sections, verticals, points, ratings, compares }
+  return { stations, sections, verticals, points, ratings, compares, reports, corrections }
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */

@@ -2,7 +2,7 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 
 /**
  * 路由表：路径与提示词逐字一致。
- * /stations、/stations/:id/sections、/sections/:id/verticals、/verticals/:id/points、/ratings、/export
+ * /stations、/stations/:id/sections、/sections/:id/verticals、/verticals/:id/points、/ratings、/reports、/export
  * 全部页面懒加载，构建时自动分包。
  */
 const routes: RouteRecordRaw[] = [
@@ -36,6 +36,12 @@ const routes: RouteRecordRaw[] = [
     name: 'rating-chart',
     component: () => import('@/pages/RatingChart.vue'),
     meta: { title: '水位流量关系点据', icon: 'TrendCharts' }
+  },
+  {
+    path: '/reports',
+    name: 'report-reconcile',
+    component: () => import('@/pages/ReportReconcile.vue'),
+    meta: { title: '报汛对账', icon: 'Bell' }
   },
   {
     path: '/export',

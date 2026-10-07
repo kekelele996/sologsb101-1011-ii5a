@@ -1,6 +1,6 @@
 # sologsb101-1011 水文站流量测验与绳套曲线台
 
-面向水文站测验与资料整编人员的纯前端单页应用：把每次测流的测站、断面测次、垂线测深、流速测点逐层落档，据此整理水位—流量关系点据完成幂函数定线，并开展比测偏差分析。数据全部保存在浏览器本地（IndexedDB），不依赖任何后端服务或外部接口。
+面向水文站测验与资料整编人员的纯前端单页应用：把每次测流的测站、断面测次、垂线测深、流速测点逐层落档，据此整理水位—流量关系点据完成幂函数定线，并开展比测偏差分析；同时支持实时报汛与实测对账——值班室按整点水位查临时关系线报出报汛流量，测验组把实测挂到盖住它的报汛时段上比对，差得多的挂待修正由值班室按约定策略重报。数据全部保存在浏览器本地（IndexedDB），不依赖任何后端服务或外部接口。
 
 ## 一、Docker 一键启动（推荐）
 
@@ -30,9 +30,9 @@ docker compose up -d --build      # 修改代码后重新构建
 | 语言 | TypeScript 5.7（strict） | 构建脚本执行 `vue-tsc --noEmit` 类型检查 |
 | UI 组件 | Element Plus 2.9 + @element-plus/icons-vue | 中文语言包，表格 / 表单 / 弹窗 / 徽标 |
 | 构建 | Vite 6 | 产物 `dist/`，交给 nginx 托管 |
-| 状态管理 | Pinia 2（setup store） | `stationStore` / `sectionStore` / `ratingStore` |
+| 状态管理 | Pinia 2（setup store） | `stationStore` / `sectionStore` / `ratingStore` / `reportStore` |
 | 路由 | Vue Router 4（history 模式） | 路径与提示词逐字一致，支持深链刷新 |
-| 持久化 | Dexie 4（IndexedDB，库名 `gbhydrogaug`） | 结构版本 v2 + upgrade 迁移 + liveQuery 订阅 |
+| 持久化 | Dexie 4（IndexedDB，库名 `gbhydrogaug`） | 结构版本 v3 + upgrade 迁移 + liveQuery 订阅 |
 | 容器 | node:20-alpine 构建 → nginx:alpine 运行 | 多阶段构建，运行阶段 `chmod -R a+rX` |
 
 ## 三、路由与功能模块
@@ -44,6 +44,7 @@ docker compose up -d --build      # 修改代码后重新构建
 | `/sections/:id/verticals` | 垂线布设与测深 | Vertical、Section | 起点距排序校验（重复即时告警）、按测点数自动生成测点行、部分面积法断面流量成果 |
 | `/verticals/:id/points` | 流速测点录入 | Point、Vertical | 逐点录入相对水深与流速、批量粘贴导入、批量改写流速、权重归一、垂线流速分布图 |
 | `/ratings` | 水位流量关系点据与定线 | Rating、Compare | 幂函数定线 Q=a(H-H0)^b（自动搜索基线并给出 R²、平均/最大残差）、超限点挂红、关系曲线绘制 |
+| `/reports` | 实时报汛与实测对账 | Report、Correction、Section、Station | 值班室按整点水位查临时关系线报汛，实测挂到盖住它的报汛时段比对，超限挂待修正并按约定策略重报 |
 | `/export` | 比测偏差分析与导出 | 全部模型 | 按测站出检测结论、比测偏差分析清单、全量 JSON 导入导出、清空重建演示数据 |
 
 带 `:id` 的层级路由在直接深链访问时同样可用：若 IndexedDB 中查不到该 id，页面渲染 `<RouteMissingPanel>` 友好空态（含返回入口与可用 id 快捷跳转），不会白屏。
@@ -71,11 +72,11 @@ sologsb101-1011/
         ├── main.ts             # 挂载 Pinia / Router / Element Plus，并打开并播种数据库
         ├── App.vue             # 顶部导航 + 上下文快捷入口 + 页脚数据概览
         ├── env.d.ts
-        ├── types/              # station / section / vertical / point / rating / compare / filter
-        ├── stores/             # stationStore / sectionStore / ratingStore
+        ├── types/              # station / section / vertical / point / rating / compare / report / correction / filter
+        ├── stores/             # stationStore / sectionStore / ratingStore / reportStore
         ├── components/common/  # DeviationTag / FilterBar / StatBadge / EmptyPanel / RouteMissingPanel
         ├── hooks/              # useIdbTable / useRatingFit
-        ├── pages/              # StationList / SectionList / VerticalBoard / PointEntry / RatingChart / ExportView
+        ├── pages/              # StationList / SectionList / VerticalBoard / PointEntry / RatingChart / ReportReconcile / ExportView
         ├── router/index.ts     # 路由表（路径与提示词逐字一致）
         ├── styles/main.css
         └── utils/              # flow.ts（流量计算）/ db.ts（Dexie 封装）/ export.ts（导入导出）
@@ -93,10 +94,10 @@ npm run preview    # 预览构建产物
 
 ## 六、数据存储说明
 
-- **存储位置**：浏览器 IndexedDB，库名 `gbhydrogaug`，当前结构版本 `v2`。页面侧由 `frontend/src/utils/db.ts` 统一封装，页面组件不直接触碰 Dexie 实例。
-- **数据表**：`stations`（测站）、`sections`（断面测次）、`verticals`（垂线）、`points`（流速测点）、`ratings`（水位流量关系点据）、`compares`（比测记录）。
-- **升级迁移**：`db.version(1)` 保留初版结构，`db.version(2).stores(...).upgrade(...)` 补齐索引并回填历史数据缺失的时间戳与判定结论；调整字段结构时递增 `DB_VERSION` 并在 `upgrade` 中补迁移。
-- **首屏播种**：`initDatabase()` 在 `stations` 表为空时执行幂等播种，生成三层互相引用的演示数据（3 个测站 / 4 个断面测次 / 8 条垂线 / 16 个流速测点 / 13 个关系点据 / 13 条比测记录），其中 C 线含 2 个超限点据用于演示挂红与偏差分析。
+- **存储位置**：浏览器 IndexedDB，库名 `gbhydrogaug`，当前结构版本 `v3`。页面侧由 `frontend/src/utils/db.ts` 统一封装，页面组件不直接触碰 Dexie 实例。
+- **数据表**：`stations`（测站）、`sections`（断面测次）、`verticals`（垂线）、`points`（流速测点）、`ratings`（水位流量关系点据）、`compares`（比测记录）、`reports`（报汛时段）、`corrections`（实测挂接校正）。
+- **升级迁移**：`db.version(1)` 保留初版结构，`db.version(2)` 补齐索引与时间戳，`db.version(3).stores(...).upgrade(...)` 新增报汛与校正两表、为测站回填修正策略，并对没有实测归属的旧报汛照时刻回填最近一次实测，对不上的保持未匹配由对账页单列；调整字段结构时递增 `DB_VERSION` 并在 `upgrade` 中补迁移。
+- **首屏播种**：`initDatabase()` 在 `stations` 表为空时执行幂等播种，生成三层互相引用的演示数据（3 个测站 / 4 个断面测次 / 8 条垂线 / 16 个流速测点 / 13 个关系点据 / 13 条比测记录 / 6 段报汛 / 4 条校正），其中 C 线含 2 个超限点据用于演示挂红与偏差分析；报汛侧含 1 段待修正、1 条待挂校正与 1 段无实测归属的报汛，用于演示对账全流程。
 - **实时同步**：`utils/db.ts` 的 `watchTable()` 基于 Dexie `liveQuery` 订阅表变化，store 里的列表自动刷新，无需手动处理刷新时机。
-- **备份与恢复**：`/export` 页可导出包含六张表的 JSON 快照，支持「覆盖导入」与「追加导入（重新分配 id）」两种模式；备份时间写入 `localStorage`。
+- **备份与恢复**：`/export` 页可导出包含八张表的 JSON 快照，支持「覆盖导入」与「追加导入（重新分配 id）」两种模式；备份时间写入 `localStorage`。
 - **离线可用**：应用为纯静态资源，无任何网络请求；换浏览器 / 清空站点数据后数据不会跟随，需通过 JSON 备份迁移。

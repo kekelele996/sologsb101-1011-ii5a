@@ -135,6 +135,31 @@ export function unitDischarge(depthM: number, meanVelocityMs: number): number {
   return round(depthM * meanVelocityMs, 3)
 }
 
+/**
+ * 由垂线与测点行直接算出某断面的实测流量（m³/s）。
+ * 测验组实测口径的唯一算法：对账挂接、升级回填与播种共用，保证两边对账时数值一致。
+ */
+export function sectionFlowFromRows(
+  verticals: Array<{ id: string; sectionId: string; no: number; startDistanceM: number; depthM: number }>,
+  points: Array<{ verticalId: string; velocityMs: number; weight: number }>,
+  sectionId: string
+): number {
+  const slices: VerticalSlice[] = verticals
+    .filter((vertical) => vertical.sectionId === sectionId)
+    .map((vertical) => ({
+      id: vertical.id,
+      no: vertical.no,
+      startDistanceM: vertical.startDistanceM,
+      depthM: vertical.depthM,
+      meanVelocityMs: calcMeanVelocity(
+        points
+          .filter((point) => point.verticalId === vertical.id)
+          .map((point) => ({ velocityMs: point.velocityMs, weight: point.weight }))
+      )
+    }))
+  return calcSectionDischarge(slices).flowM3s
+}
+
 /** 流速仪测点历时换算：转数 / 历时 → 流速（简化直线公式，供测点录入校验提示） */
 export function velocityFromRevolutions(revolutions: number, durationS: number, k = 0.25, c = 0.01): number {
   if (!Number.isFinite(revolutions) || !Number.isFinite(durationS) || durationS <= 0) return 0

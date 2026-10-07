@@ -13,7 +13,16 @@ import {
 } from '@/utils/db'
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
+export const BACKUP_KEYS = [
+  'stations',
+  'sections',
+  'verticals',
+  'points',
+  'ratings',
+  'compares',
+  'reports',
+  'corrections'
+] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 /** 各表行数统计（导出页展示与导入结果回执共用） */
@@ -21,13 +30,15 @@ export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, reports, corrections] = await Promise.all([
     db.stations.toArray(),
     db.sections.toArray(),
     db.verticals.toArray(),
     db.points.toArray(),
     db.ratings.toArray(),
-    db.compares.toArray()
+    db.compares.toArray(),
+    db.reports.toArray(),
+    db.corrections.toArray()
   ])
   return {
     app: 'gbhydrogaug',
@@ -38,7 +49,9 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     verticals,
     points,
     ratings,
-    compares
+    compares,
+    reports,
+    corrections
   }
 }
 
@@ -53,6 +66,8 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     errors.push('app 字段应为 gbhydrogaug，文件来源不明')
   }
   for (const key of BACKUP_KEYS) {
+    // reports / corrections 为 v3 新增表：旧版备份没有这两张表，按空数组兜底而非报错
+    if (key === 'reports' || key === 'corrections') continue
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
@@ -65,7 +80,9 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     verticals: obj.verticals ?? [],
     points: obj.points ?? [],
     ratings: obj.ratings ?? [],
-    compares: obj.compares ?? []
+    compares: obj.compares ?? [],
+    reports: obj.reports ?? [],
+    corrections: obj.corrections ?? []
   }
   return { ok: true, errors, payload }
 }
@@ -78,7 +95,9 @@ export function countPayload(payload: BackupPayload): CountMap {
     verticals: payload.verticals.length,
     points: payload.points.length,
     ratings: payload.ratings.length,
-    compares: payload.compares.length
+    compares: payload.compares.length,
+    reports: payload.reports.length,
+    corrections: payload.corrections.length
   }
 }
 
@@ -116,7 +135,7 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.reports, db.corrections],
     async () => {
       await db.stations.bulkPut(payload.stations)
       await db.sections.bulkPut(payload.sections)
@@ -124,6 +143,8 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
       await db.points.bulkPut(payload.points)
       await db.ratings.bulkPut(payload.ratings)
       await db.compares.bulkPut(payload.compares)
+      await db.reports.bulkPut(payload.reports)
+      await db.corrections.bulkPut(payload.corrections)
     }
   )
   return countPayload(payload)
@@ -135,6 +156,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const sectionMap = new Map<string, string>()
   const verticalMap = new Map<string, string>()
   const ratingMap = new Map<string, string>()
+  const reportMap = new Map<string, string>()
 
   const stations = payload.stations.map((station) => {
     const id = createId('stn')
@@ -166,7 +188,18 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('cmp'),
     ratingId: ratingMap.get(compare.ratingId) ?? compare.ratingId
   }))
-  return { ...payload, stations, sections, verticals, points, ratings, compares }
+  const reports = payload.reports.map((report) => {
+    const id = createId('rep')
+    reportMap.set(report.id, id)
+    return { ...report, id, stationId: stationMap.get(report.stationId) ?? report.stationId }
+  })
+  const corrections = payload.corrections.map((correction) => ({
+    ...correction,
+    id: createId('cor'),
+    reportId: reportMap.get(correction.reportId) ?? correction.reportId,
+    sectionId: sectionMap.get(correction.sectionId) ?? correction.sectionId
+  }))
+  return { ...payload, stations, sections, verticals, points, ratings, compares, reports, corrections }
 }
 
 /**

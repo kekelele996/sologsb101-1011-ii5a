@@ -1,6 +1,8 @@
 /** 水位流量关系点据的定线编号（可多条并存，用于区分不同年份的绳套曲线） */
 export const LINE_NOS = ['A', 'B', 'C'] as const
 
+import type { CorrectionPolicy } from './report'
+
 /** 测站：水文测验的基本单元 */
 export interface Station {
   id: string
@@ -14,6 +16,11 @@ export interface Station {
   sectionCode: string
   /** 备注 */
   remark: string
+  /**
+   * 修正策略：实测值只改本次报汛，还是整段照实测偏移重报。
+   * 两边商量定后按站记录，报汛对账页写明当前照哪条走；缺省按「只改本次报汛」。
+   */
+  correctionPolicy?: CorrectionPolicy
   createdAt: number
   updatedAt: number
 }
