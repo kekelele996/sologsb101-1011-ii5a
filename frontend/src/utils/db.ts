@@ -12,12 +12,15 @@ import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
+import type { ReportPeriod } from '@/types/reportPeriod'
+import type { FlowCorrection, MeasurementLink } from '@/types/flowCorrection'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
+import { calcReportDeviationPct, isReportDeviationOverLimit, isTimeCovered } from '@/types/reportPeriod'
 import { fitPowerCurve } from '@/types/rating'
 import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +43,9 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  reportPeriods: ReportPeriod[]
+  measurementLinks: MeasurementLink[]
+  flowCorrections: FlowCorrection[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +55,9 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  reportPeriods!: Table<ReportPeriod, string>
+  measurementLinks!: Table<MeasurementLink, string>
+  flowCorrections!: Table<FlowCorrection, string>
 
   constructor() {
     super(DB_NAME)
@@ -64,7 +73,7 @@ class HydroGaugeDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（河名/集水面积、水位、测法、偏差判定）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
         sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
@@ -77,7 +86,7 @@ class HydroGaugeDatabase extends Dexie {
         // 迁移：历史数据补齐时间戳与判定结论，避免列表排序与筛选拿到 undefined
         const stamps: Array<[string, () => Record<string, unknown>]> = [
           ['stations', () => ({})],
-          ['sections', () => ({ measuredAt: new Date().toISOString() })],
+          ['sections', () => ({ measuredAt: new Date().toISOString(), measuredFlowM3s: null })],
           ['verticals', () => ({ pointCount: 0, bedNote: '' })],
           ['points', () => ({ weight: DEFAULT_WEIGHTS[1], durationS: 100 })],
           ['ratings', () => ({ measureNo: '', lineNo: 'A' })],
@@ -95,6 +104,55 @@ class HydroGaugeDatabase extends Dexie {
             })
         }
       })
+
+    // v3：拆分实时报汛时段、实测归属与值班室校正单；旧数据按测流时刻回填
+    this.version(DB_VERSION)
+      .stores({
+        stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
+        sections: 'id, stationId, measureNo, method, stageM, measuredAt, measuredFlowM3s, updatedAt',
+        verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
+        points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
+        ratings: 'id, stationId, lineNo, stageM, flowM3s, measuredAt, updatedAt',
+        compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt',
+        reportPeriods: 'id, stationId, startedAt, endedAt, temporaryLineNo, segmentNo, updatedAt',
+        measurementLinks: 'id, sectionId, stationId, reportPeriodId, measuredAt, status, updatedAt',
+        flowCorrections: 'id, stationId, reportPeriodId, sectionId, measurementLinkId, status, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now()
+        const sectionsTable = tx.table<Section, string>('sections')
+        const ratingsTable = tx.table<Rating, string>('ratings')
+        const comparesTable = tx.table<Compare, string>('compares')
+        const reportTable = tx.table<ReportPeriod, string>('reportPeriods')
+        const linkTable = tx.table<MeasurementLink, string>('measurementLinks')
+        const correctionTable = tx.table<FlowCorrection, string>('flowCorrections')
+
+        const [sections, ratings, compares] = await Promise.all([
+          sectionsTable.toArray(),
+          ratingsTable.toArray(),
+          comparesTable.toArray()
+        ])
+
+        // 旧测次没有独立实测流量字段时，用同站时刻最近的关系点据回填。
+        sections.forEach((section) => {
+          if (typeof section.measuredFlowM3s === 'number' && Number.isFinite(section.measuredFlowM3s)) return
+          const candidates = ratings
+            .filter((rating) => rating.stationId === section.stationId)
+            .sort(
+              (a, b) =>
+                Math.abs(Date.parse(a.measuredAt) - Date.parse(section.measuredAt)) -
+                Math.abs(Date.parse(b.measuredAt) - Date.parse(section.measuredAt))
+            )
+          section.measuredFlowM3s = candidates[0]?.flowM3s ?? null
+          section.updatedAt = now
+        })
+        await sectionsTable.bulkPut(sections)
+
+        const records = buildReconcileSeeds(sections, ratings, compares, now)
+        await reportTable.bulkPut(records.reportPeriods)
+        await linkTable.bulkPut(records.measurementLinks)
+        await correctionTable.bulkPut(records.flowCorrections)
+      })
   }
 }
 
@@ -104,6 +162,144 @@ export const db = new HydroGaugeDatabase()
 export function createId(prefix: string): string {
   const rand = Math.random().toString(36).slice(2, 8)
   return `${prefix}_${Date.now().toString(36)}${rand}`
+}
+
+/** v3 升级与新库播种共用：按整点生成报汛时段，并把旧实测按时刻回填归属 */
+function buildReconcileSeeds(
+  sections: Section[],
+  ratings: Rating[],
+  compares: Compare[],
+  now: number
+): {
+  reportPeriods: ReportPeriod[]
+  measurementLinks: MeasurementLink[]
+  flowCorrections: FlowCorrection[]
+} {
+  const reportById = new Map<string, ReportPeriod>()
+  const compareByRatingId = new Map(compares.map((compare) => [compare.ratingId, compare]))
+
+  ratings.forEach((rating, index) => {
+    const hourStart = new Date(Date.parse(rating.measuredAt))
+    hourStart.setMinutes(0, 0, 0)
+    hourStart.setSeconds(0, 0)
+    hourStart.setMilliseconds(0)
+    const hourEnd = new Date(hourStart.getTime() + 60 * 60 * 1000)
+    const id = `rpt_seed_${rating.stationId}_${hourStart.getTime()}`
+    if (reportById.has(id)) return
+    const compare = compareByRatingId.get(rating.id)
+    reportById.set(id, {
+      id,
+      stationId: rating.stationId,
+      startedAt: hourStart.toISOString(),
+      endedAt: hourEnd.toISOString(),
+      hourStageM: rating.stageM,
+      reportedFlowM3s: compare?.curveFlow ?? rating.flowM3s,
+      temporaryLineNo: `临时-${rating.lineNo}`,
+      segmentNo: `SEG-${rating.lineNo}`,
+      correctionPolicy: rating.lineNo === 'C' ? '整段偏移' : '单次修正',
+      reporter: '值班室',
+      createdAt: now + index,
+      updatedAt: now + index
+    })
+  })
+
+  const reportPeriods = Array.from(reportById.values()).sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt))
+  const measurementLinks: MeasurementLink[] = []
+  const linkByReportId = new Map<string, MeasurementLink>()
+
+  reportPeriods.forEach((report, index) => {
+    const rating = ratings.find(
+      (item) =>
+        item.stationId === report.stationId &&
+        isTimeCovered(report.startedAt, report.endedAt, item.measuredAt) &&
+        item.lineNo === report.temporaryLineNo.replace('临时-', '')
+    )
+    const section = sections.find(
+      (item) => item.stationId === report.stationId && isTimeCovered(report.startedAt, report.endedAt, item.measuredAt)
+    )
+    const measuredFlow = typeof section?.measuredFlowM3s === 'number' ? section.measuredFlowM3s : rating?.flowM3s ?? null
+    const matched = Boolean(section && rating && measuredFlow !== null)
+    const deviation = measuredFlow === null ? 0 : calcReportDeviationPct(measuredFlow, report.reportedFlowM3s)
+    const link: MeasurementLink = {
+      id: `lnk_seed_${report.id}`,
+      sectionId: section?.id ?? '',
+      stationId: report.stationId,
+      reportPeriodId: matched ? report.id : null,
+      measuredAt: rating?.measuredAt ?? report.startedAt,
+      measuredFlowM3s: measuredFlow ?? 0,
+      reportedFlowM3s: matched ? report.reportedFlowM3s : null,
+      deviationPct: matched ? deviation : 0,
+      status: matched ? '已挂' : '待挂',
+      unmatchedReason: matched
+        ? ''
+        : `升级时按 ${new Date(report.startedAt).toLocaleString('zh-CN')} 回填最近实测，但该关系点据没有对应断面测次，单列待核`,
+      linkedAt: now + index,
+      createdAt: now + index,
+      updatedAt: now + index
+    }
+    measurementLinks.push(link)
+    linkByReportId.set(report.id, link)
+  })
+
+  // 已有点据但找不到盖住它的报汛时段，也单列待挂，避免旧实测丢失归属线索。
+  sections.forEach((section, index) => {
+    const measuredFlow = section.measuredFlowM3s
+    if (measuredFlow === null || !Number.isFinite(measuredFlow)) return
+    const covered = reportPeriods.some(
+      (report) => report.stationId === section.stationId && isTimeCovered(report.startedAt, report.endedAt, section.measuredAt)
+    )
+    if (covered) return
+    measurementLinks.push({
+      id: `lnk_seed_unmatched_${section.id}`,
+      sectionId: section.id,
+      stationId: section.stationId,
+      reportPeriodId: null,
+      measuredAt: section.measuredAt,
+      measuredFlowM3s: measuredFlow,
+      reportedFlowM3s: null,
+      deviationPct: 0,
+      status: '待挂',
+      unmatchedReason: '升级时未找到盖住该测流时刻的报汛时段，需测验组人工重挂',
+      linkedAt: now + index,
+      createdAt: now + index,
+      updatedAt: now + index
+    })
+  })
+
+  const flowCorrections: FlowCorrection[] = []
+  compares.forEach((compare, index) => {
+    const rating = ratings.find((item) => item.id === compare.ratingId)
+    if (!rating) return
+    const hourStart = new Date(Date.parse(rating.measuredAt))
+    hourStart.setMinutes(0, 0, 0)
+    const report = reportById.get(`rpt_seed_${rating.stationId}_${hourStart.getTime()}`)
+    const link = report ? linkByReportId.get(report.id) : undefined
+    const deviation = calcReportDeviationPct(rating.flowM3s, report?.reportedFlowM3s ?? compare.curveFlow)
+    if (!report || !link || !isReportDeviationOverLimit(deviation)) return
+    flowCorrections.push({
+      id: `cor_seed_${rating.id}`,
+      stationId: rating.stationId,
+      reportPeriodId: report.id,
+      sectionId: link.sectionId || null,
+      measurementLinkId: link.id,
+      policy: report.correctionPolicy,
+      segmentNo: report.segmentNo,
+      originalReportedFlowM3s: report.reportedFlowM3s,
+      measuredFlowM3s: rating.flowM3s,
+      deviationPct: deviation,
+      affectedReportPeriodIds: [],
+      revisedFlowByReportId: {},
+      status: '待修正',
+      decidedBy: '测验组/值班室',
+      decidedAt: rating.measuredAt,
+      reissuedAt: null,
+      note: '旧库升级按测流时刻回填，偏差超限待值班室重报',
+      createdAt: now + index,
+      updatedAt: now + index
+    })
+  })
+
+  return { reportPeriods, measurementLinks, flowCorrections }
 }
 
 /** 订阅单表变化（liveQuery），返回取消订阅函数 */
@@ -155,7 +351,8 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 12.5,
           stageM: 5.42,
           method: '流速仪',
-          measuredAt: '2024-06-12T08:30:00.000Z'
+          measuredAt: '2024-06-12T08:30:00.000Z',
+          measuredFlowM3s: 217.2
         },
         {
           id: 'sec_lh_2407',
@@ -164,7 +361,8 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 12.5,
           stageM: 6.15,
           method: 'ADCP',
-          measuredAt: '2024-07-18T09:10:00.000Z'
+          measuredAt: '2024-07-18T09:10:00.000Z',
+          measuredFlowM3s: 298.5
         }
       ],
       verticals: [
@@ -203,7 +401,8 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 4.2,
           stageM: 3.18,
           method: '浮标',
-          measuredAt: '2024-05-22T07:50:00.000Z'
+          measuredAt: '2024-05-22T07:50:00.000Z',
+          measuredFlowM3s: 56.1
         },
         {
           id: 'sec_qj_2408',
@@ -212,7 +411,8 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 4.2,
           stageM: 4.36,
           method: '流速仪',
-          measuredAt: '2024-08-09T06:40:00.000Z'
+          measuredAt: '2024-08-09T06:40:00.000Z',
+          measuredFlowM3s: 115.6
         }
       ],
       verticals: [
@@ -251,7 +451,8 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 18.0,
           stageM: 5.36,
           method: 'ADCP',
-          measuredAt: '2024-06-20T10:05:00.000Z'
+          measuredAt: '2024-06-20T10:05:00.000Z',
+          measuredFlowM3s: 203.5
         }
       ],
       verticals: [
@@ -289,7 +490,17 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [
+      db.stations,
+      db.sections,
+      db.verticals,
+      db.points,
+      db.ratings,
+      db.compares,
+      db.reportPeriods,
+      db.measurementLinks,
+      db.flowCorrections
+    ],
     async () => {
       const stamp = (row: { id: string }): { createdAt: number; updatedAt: number } => ({
         createdAt: now + row.id.length,
@@ -357,6 +568,15 @@ export async function seedDemoData(): Promise<void> {
           updatedAt: now
         })
       }
+
+      const seededSections = stationBundles.flatMap((bundle) =>
+        bundle.sections.map((section) => ({ ...section, ...stamp(section) }))
+      )
+      const seededRatings = ratingSeeds.map((rating) => ({ ...rating, ...stamp(rating) }))
+      const reconcileSeeds = buildReconcileSeeds(seededSections, seededRatings, compares, now)
+      await db.reportPeriods.bulkPut(reconcileSeeds.reportPeriods)
+      await db.measurementLinks.bulkPut(reconcileSeeds.measurementLinks)
+      await db.flowCorrections.bulkPut(reconcileSeeds.flowCorrections)
     }
   )
 }
@@ -375,7 +595,17 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [
+      db.stations,
+      db.sections,
+      db.verticals,
+      db.points,
+      db.ratings,
+      db.compares,
+      db.reportPeriods,
+      db.measurementLinks,
+      db.flowCorrections
+    ],
     async () => {
       await Promise.all([
         db.stations.clear(),
@@ -383,7 +613,10 @@ export async function clearAllTables(): Promise<void> {
         db.verticals.clear(),
         db.points.clear(),
         db.ratings.clear(),
-        db.compares.clear()
+        db.compares.clear(),
+        db.reportPeriods.clear(),
+        db.measurementLinks.clear(),
+        db.flowCorrections.clear()
       ])
     }
   )
@@ -397,15 +630,19 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
-    db.stations.count(),
-    db.sections.count(),
-    db.verticals.count(),
-    db.points.count(),
-    db.ratings.count(),
-    db.compares.count()
-  ])
-  return { stations, sections, verticals, points, ratings, compares }
+  const [stations, sections, verticals, points, ratings, compares, reportPeriods, measurementLinks, flowCorrections] =
+    await Promise.all([
+      db.stations.count(),
+      db.sections.count(),
+      db.verticals.count(),
+      db.points.count(),
+      db.ratings.count(),
+      db.compares.count(),
+      db.reportPeriods.count(),
+      db.measurementLinks.count(),
+      db.flowCorrections.count()
+    ])
+  return { stations, sections, verticals, points, ratings, compares, reportPeriods, measurementLinks, flowCorrections }
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */

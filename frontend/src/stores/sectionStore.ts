@@ -10,6 +10,7 @@ import { createEmptySectionFilter, type SectionFilterState } from '@/types/secti
 import type { Vertical } from '@/types/vertical'
 import { buildRelativeDepths } from '@/types/vertical'
 import type { Point } from '@/types/point'
+import { calcMeanVelocity, calcSectionDischarge } from '@/utils/flow'
 
 /** 垂线录入草稿（新增/编辑表单共享结构） */
 export interface VerticalDraft {
@@ -192,14 +193,29 @@ export const useSectionStore = defineStore('section', () => {
   }
 
   async function removeSection(id: string): Promise<void> {
-    await db.transaction('rw', [db.sections, db.verticals, db.points], async () => {
-      const verticalIds = (await db.verticals.where('sectionId').equals(id).toArray()).map((row) => row.id)
-      if (verticalIds.length > 0) {
-        await db.points.where('verticalId').anyOf(verticalIds).delete()
-        await db.verticals.bulkDelete(verticalIds)
+    await db.transaction(
+      'rw',
+      [db.sections, db.verticals, db.points, db.measurementLinks, db.flowCorrections],
+      async () => {
+        const verticalIds = (await db.verticals.where('sectionId').equals(id).toArray()).map((row) => row.id)
+        if (verticalIds.length > 0) {
+          await db.points.where('verticalId').anyOf(verticalIds).delete()
+          await db.verticals.bulkDelete(verticalIds)
+        }
+        const linkIds = (await db.measurementLinks.where('sectionId').equals(id).toArray()).map((row) => row.id)
+        if (linkIds.length > 0) {
+          await db.flowCorrections.where('measurementLinkId').anyOf(linkIds).modify((correction) => {
+            correction.sectionId = null
+            correction.measurementLinkId = null
+            correction.status = '已失效'
+            correction.note = `${correction.note}｜原测次已删除，校正单仅存档`.trim()
+            correction.updatedAt = Date.now()
+          })
+          await db.measurementLinks.bulkDelete(linkIds)
+        }
+        await db.sections.delete(id)
       }
-      await db.sections.delete(id)
-    })
+    )
   }
 
   /* ------------------------------- 垂线 ------------------------------- */
@@ -338,6 +354,27 @@ export const useSectionStore = defineStore('section', () => {
     return rows.length
   }
 
+  /** 按垂线与测点重算某断面实测流量，结果写回测次记录 */
+  function dischargeOfSection(sectionId: string): ReturnType<typeof calcSectionDischarge> {
+    const rows = verticalsOfSection(sectionId).map((vertical) => {
+      const verticalPoints = pointsOfVertical(vertical.id)
+      return {
+        id: vertical.id,
+        no: vertical.no,
+        startDistanceM: vertical.startDistanceM,
+        depthM: vertical.depthM,
+        meanVelocityMs: calcMeanVelocity(verticalPoints.map((point) => ({ velocityMs: point.velocityMs, weight: point.weight })))
+      }
+    })
+    return calcSectionDischarge(rows)
+  }
+
+  async function recalcSectionFlow(sectionId: string): Promise<number> {
+    const result = dischargeOfSection(sectionId)
+    if (result.flowM3s > 0) await updateSection(sectionId, { measuredFlowM3s: result.flowM3s })
+    return result.flowM3s
+  }
+
   return {
     sections,
     verticals,
@@ -379,6 +416,8 @@ export const useSectionStore = defineStore('section', () => {
     bulkSetVelocity,
     importPointDrafts,
     syncVerticalPointCount,
-    normalizeWeights
+    normalizeWeights,
+    dischargeOfSection,
+    recalcSectionFlow
   }
 })

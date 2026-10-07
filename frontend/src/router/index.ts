@@ -32,6 +32,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '流速测点录入', icon: 'DataLine' }
   },
   {
+    path: '/reconcile',
+    name: 'flow-reconcile',
+    component: () => import('@/pages/ReconcileView.vue'),
+    meta: { title: '实测报汛对账', icon: 'Bell' }
+  },
+  {
     path: '/ratings',
     name: 'rating-chart',
     component: () => import('@/pages/RatingChart.vue'),

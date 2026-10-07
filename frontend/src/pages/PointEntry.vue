@@ -7,12 +7,13 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, DocumentCopy, Edit, MagicStick, Plus, TrendCharts } from '@element-plus/icons-vue'
+import { Delete, DocumentCopy, Edit, MagicStick, Odometer, Plus, TrendCharts } from '@element-plus/icons-vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useReportStore } from '@/stores/reportStore'
 import { parsePointPaste } from '@/types/point'
 import type { Point } from '@/types/point'
 import { calcMeanVelocity, calcSectionDischarge, velocityFromRevolutions } from '@/utils/flow'
@@ -22,6 +23,7 @@ const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const reportStore = useReportStore()
 
 const verticalId = computed(() => String(route.params.id ?? ''))
 const vertical = computed(() => sectionStore.verticals.find((item) => item.id === verticalId.value) ?? null)
@@ -121,9 +123,11 @@ async function submitForm(): Promise<void> {
   try {
     if (editingId.value) {
       await sectionStore.updatePoint(editingId.value, { ...form })
+      await syncSectionFlow()
       ElMessage.success('测点已更新')
     } else {
       await sectionStore.createPoint(verticalId.value, { ...form })
+      await syncSectionFlow()
       ElMessage.success('测点已新增')
     }
     dialogVisible.value = false
@@ -143,6 +147,7 @@ async function removePoint(point: Point): Promise<void> {
     return
   }
   await sectionStore.removePoint(point.id)
+  await syncSectionFlow()
   ElMessage.success('测点已删除')
 }
 
@@ -178,6 +183,7 @@ async function importPaste(): Promise<void> {
     return
   }
   const count = await sectionStore.importPointDrafts(verticalId.value, parsed.rows)
+  await syncSectionFlow()
   pasteVisible.value = false
   ElMessage.success(`已导入 ${count} 个测点，垂线平均流速已重算`)
 }
@@ -197,12 +203,34 @@ async function applyBulkVelocity(): Promise<void> {
     return
   }
   const count = await sectionStore.bulkSetVelocity(verticalId.value, bulkVelocity.value)
+  await syncSectionFlow()
   ElMessage.success(`已改写 ${count} 个测点流速`)
 }
 
 async function doNormalize(): Promise<void> {
   const count = await sectionStore.normalizeWeights(verticalId.value)
+  if (section.value) {
+    await sectionStore.recalcSectionFlow(section.value.id)
+    await reportStore.ensureSectionLink(section.value.id)
+  }
   ElMessage.success(`已按 ${count} 个测点平均分配计算权重`)
+}
+
+async function saveSectionDischarge(): Promise<void> {
+  if (!section.value) return
+  const value = await sectionStore.recalcSectionFlow(section.value.id)
+  if (value > 0) {
+    await reportStore.ensureSectionLink(section.value.id)
+    ElMessage.success(`已把实测断面流量 ${value.toFixed(2)} m³/s 回写到测次并完成报汛对账`)
+  } else {
+    ElMessage.warning('当前数据未算出有效断面流量')
+  }
+}
+
+async function syncSectionFlow(): Promise<void> {
+  if (!section.value) return
+  await sectionStore.recalcSectionFlow(section.value.id)
+  await reportStore.ensureSectionLink(section.value.id)
 }
 
 /** 由转数推算流速（流速仪公式），填回表单 */
@@ -264,6 +292,7 @@ onMounted(() => {
         </div>
         <div class="page__actions">
           <el-button :icon="MagicStick" @click="doNormalize">权重归一</el-button>
+          <el-button type="success" plain :icon="Odometer" @click="saveSectionDischarge">回写实测量</el-button>
           <el-button :icon="DocumentCopy" @click="openPaste">批量粘贴</el-button>
           <el-button type="primary" :icon="Plus" @click="openCreate">新增测点</el-button>
         </div>

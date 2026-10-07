@@ -18,6 +18,8 @@ export interface Section {
   method: MeasureMethod
   /** 测流时间 */
   measuredAt: string
+  /** 实测断面流量（m³/s）；垂线测点算成后可回填，也可手工登记 */
+  measuredFlowM3s: number | null
   createdAt: number
   updatedAt: number
 }

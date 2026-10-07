@@ -14,6 +14,7 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useReportStore } from '@/stores/reportStore'
 import { MEASURE_METHODS, type MeasureMethod, type Section } from '@/types/section'
 import { initDatabase } from '@/utils/db'
 
@@ -21,6 +22,7 @@ const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const reportStore = useReportStore()
 
 const stationId = computed(() => String(route.params.id ?? ''))
 const station = computed(() => stationStore.stationById(stationId.value))
@@ -32,6 +34,7 @@ const form = reactive({
   measureNo: '',
   startDistanceM: 0,
   stageM: 0,
+  measuredFlowM3s: null as number | null,
   method: '流速仪' as MeasureMethod,
   measuredAt: new Date().toISOString().slice(0, 16)
 })
@@ -80,6 +83,7 @@ function openCreate(): void {
   ).padStart(3, '0')}`
   form.startDistanceM = stats.value.latest?.startDistanceM ?? 0
   form.stageM = stats.value.latest?.stageM ?? 0
+  form.measuredFlowM3s = null
   form.method = '流速仪'
   form.measuredAt = new Date().toISOString().slice(0, 16)
   dialogVisible.value = true
@@ -90,6 +94,7 @@ function openEdit(section: Section): void {
   form.measureNo = section.measureNo
   form.startDistanceM = section.startDistanceM
   form.stageM = section.stageM
+  form.measuredFlowM3s = section.measuredFlowM3s
   form.method = section.method
   form.measuredAt = section.measuredAt.slice(0, 16)
   dialogVisible.value = true
@@ -119,6 +124,7 @@ async function submitForm(): Promise<void> {
       measureNo: form.measureNo.trim(),
       startDistanceM: form.startDistanceM,
       stageM: form.stageM,
+      measuredFlowM3s: form.measuredFlowM3s,
       method: form.method,
       measuredAt: new Date(form.measuredAt).toISOString()
     }
@@ -128,6 +134,7 @@ async function submitForm(): Promise<void> {
     } else {
       const created = await sectionStore.createSection(payload)
       sectionStore.selectSection(created.id)
+      if (created.measuredFlowM3s !== null) await reportStore.ensureSectionLink(created.id)
       ElMessage.success(`测次已新增，当前水位 ${created.stageM.toFixed(2)} m`)
     }
     dialogVisible.value = false
@@ -286,6 +293,24 @@ onMounted(() => {
             <span class="gb-mono">{{ row.stageM.toFixed(2) }}</span>
           </template>
         </el-table-column>
+        <el-table-column label="实测流量 / 对账" width="210">
+          <template #default="{ row }">
+            <div class="gb-mono">{{ row.measuredFlowM3s === null ? '待算' : `${row.measuredFlowM3s.toFixed(1)} m³/s` }}</div>
+            <el-tag
+              size="small"
+              :type="
+                reportStore.linkOfSection(row.id)?.status === '已挂'
+                  ? 'success'
+                  : reportStore.linkOfSection(row.id)?.status === '待挂'
+                    ? 'warning'
+                    : 'info'
+              "
+              effect="plain"
+            >
+              {{ reportStore.linkOfSection(row.id)?.status ?? '未对账' }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="起点距 (m)" width="120" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.startDistanceM.toFixed(1) }}</span>
@@ -334,6 +359,18 @@ onMounted(() => {
         <el-form-item label="水位" required>
           <el-input-number v-model="form.stageM" :min="-50" :max="200" :step="0.01" :precision="2" controls-position="right" />
           <span class="page__unit">m</span>
+        </el-form-item>
+        <el-form-item label="实测流量">
+          <el-input-number
+            v-model="form.measuredFlowM3s"
+            :min="0"
+            :max="100000"
+            :step="1"
+            :precision="1"
+            controls-position="right"
+            placeholder="垂线测点算成后回填"
+          />
+          <span class="page__unit">m³/s，留空表示待重算</span>
         </el-form-item>
         <el-form-item label="起点距" required>
           <el-input-number v-model="form.startDistanceM" :min="0" :max="2000" :step="0.5" :precision="1" controls-position="right" />

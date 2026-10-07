@@ -13,7 +13,17 @@ import {
 } from '@/utils/db'
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
+export const BACKUP_KEYS = [
+  'stations',
+  'sections',
+  'verticals',
+  'points',
+  'ratings',
+  'compares',
+  'reportPeriods',
+  'measurementLinks',
+  'flowCorrections'
+] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 /** 各表行数统计（导出页展示与导入结果回执共用） */
@@ -21,14 +31,18 @@ export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
-    db.stations.toArray(),
-    db.sections.toArray(),
-    db.verticals.toArray(),
-    db.points.toArray(),
-    db.ratings.toArray(),
-    db.compares.toArray()
-  ])
+  const [stations, sections, verticals, points, ratings, compares, reportPeriods, measurementLinks, flowCorrections] =
+    await Promise.all([
+      db.stations.toArray(),
+      db.sections.toArray(),
+      db.verticals.toArray(),
+      db.points.toArray(),
+      db.ratings.toArray(),
+      db.compares.toArray(),
+      db.reportPeriods.toArray(),
+      db.measurementLinks.toArray(),
+      db.flowCorrections.toArray()
+    ])
   return {
     app: 'gbhydrogaug',
     dbVersion: DB_VERSION,
@@ -38,7 +52,10 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     verticals,
     points,
     ratings,
-    compares
+    compares,
+    reportPeriods,
+    measurementLinks,
+    flowCorrections
   }
 }
 
@@ -65,7 +82,10 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     verticals: obj.verticals ?? [],
     points: obj.points ?? [],
     ratings: obj.ratings ?? [],
-    compares: obj.compares ?? []
+    compares: obj.compares ?? [],
+    reportPeriods: obj.reportPeriods ?? [],
+    measurementLinks: obj.measurementLinks ?? [],
+    flowCorrections: obj.flowCorrections ?? []
   }
   return { ok: true, errors, payload }
 }
@@ -78,7 +98,10 @@ export function countPayload(payload: BackupPayload): CountMap {
     verticals: payload.verticals.length,
     points: payload.points.length,
     ratings: payload.ratings.length,
-    compares: payload.compares.length
+    compares: payload.compares.length,
+    reportPeriods: payload.reportPeriods.length,
+    measurementLinks: payload.measurementLinks.length,
+    flowCorrections: payload.flowCorrections.length
   }
 }
 
@@ -116,7 +139,17 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [
+      db.stations,
+      db.sections,
+      db.verticals,
+      db.points,
+      db.ratings,
+      db.compares,
+      db.reportPeriods,
+      db.measurementLinks,
+      db.flowCorrections
+    ],
     async () => {
       await db.stations.bulkPut(payload.stations)
       await db.sections.bulkPut(payload.sections)
@@ -124,6 +157,9 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
       await db.points.bulkPut(payload.points)
       await db.ratings.bulkPut(payload.ratings)
       await db.compares.bulkPut(payload.compares)
+      await db.reportPeriods.bulkPut(payload.reportPeriods)
+      await db.measurementLinks.bulkPut(payload.measurementLinks)
+      await db.flowCorrections.bulkPut(payload.flowCorrections)
     }
   )
   return countPayload(payload)
@@ -135,6 +171,8 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const sectionMap = new Map<string, string>()
   const verticalMap = new Map<string, string>()
   const ratingMap = new Map<string, string>()
+  const reportMap = new Map<string, string>()
+  const linkMap = new Map<string, string>()
 
   const stations = payload.stations.map((station) => {
     const id = createId('stn')
@@ -166,7 +204,53 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('cmp'),
     ratingId: ratingMap.get(compare.ratingId) ?? compare.ratingId
   }))
-  return { ...payload, stations, sections, verticals, points, ratings, compares }
+  const reports = payload.reportPeriods.map((report) => {
+    const id = createId('rpt')
+    reportMap.set(report.id, id)
+    return { ...report, id, stationId: stationMap.get(report.stationId) ?? report.stationId }
+  })
+  const links = payload.measurementLinks.map((link) => {
+    const id = createId('lnk')
+    linkMap.set(link.id, id)
+    const oldReportId = link.reportPeriodId
+    return {
+      ...link,
+      id,
+      stationId: stationMap.get(link.stationId) ?? link.stationId,
+      sectionId: link.sectionId ? sectionMap.get(link.sectionId) ?? link.sectionId : link.sectionId,
+      reportPeriodId: oldReportId ? reportMap.get(oldReportId) ?? oldReportId : null
+    }
+  })
+  const corrections = payload.flowCorrections.map((correction) => {
+    const affectedReportPeriodIds = correction.affectedReportPeriodIds.map((id) => reportMap.get(id) ?? id)
+    const revisedFlowByReportId = Object.fromEntries(
+      Object.entries(correction.revisedFlowByReportId).map(([id, value]) => [reportMap.get(id) ?? id, value])
+    )
+    const oldReportId = correction.reportPeriodId
+    const oldLinkId = correction.measurementLinkId
+    return {
+      ...correction,
+      id: createId('cor'),
+      stationId: stationMap.get(correction.stationId) ?? correction.stationId,
+      reportPeriodId: oldReportId ? reportMap.get(oldReportId) ?? oldReportId : oldReportId,
+      sectionId: correction.sectionId ? sectionMap.get(correction.sectionId) ?? correction.sectionId : null,
+      measurementLinkId: oldLinkId ? linkMap.get(oldLinkId) ?? oldLinkId : null,
+      affectedReportPeriodIds,
+      revisedFlowByReportId
+    }
+  })
+  return {
+    ...payload,
+    stations,
+    sections,
+    verticals,
+    points,
+    ratings,
+    compares,
+    reportPeriods: reports,
+    measurementLinks: links,
+    flowCorrections: corrections
+  }
 }
 
 /**
